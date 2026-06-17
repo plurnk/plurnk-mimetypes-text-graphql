@@ -41,7 +41,10 @@ class TextGraphqlVisitor extends withExtractor(GraphQLVisitor) {
         const name = nameText(ctx.name?.());
         if (!name) return null;
         this.addSymbol("class", name, ctx);
-        this.visitChildren(ctx);
+        // `implements X & Y` → inherit edges (container = this type).
+        this.emitImplements(ctx.implementsInterfaces?.(), name);
+        // Scope the body so each field's type ref carries container = this type.
+        this.gateContainer(name, ctx);
         return null;
     };
 
@@ -50,14 +53,24 @@ class TextGraphqlVisitor extends withExtractor(GraphQLVisitor) {
         const name = nameText(ctx.name?.());
         if (!name) return null;
         this.addSymbol("interface", name, ctx);
-        this.visitChildren(ctx);
+        this.emitImplements(ctx.implementsInterfaces?.(), name);
+        this.gateContainer(name, ctx);
         return null;
     };
 
     visitUnionTypeDefinition = (ctx: any): null => {
         if (this.inBody) return null;
         const name = nameText(ctx.name?.());
-        if (name) this.addSymbol("type", name, ctx);
+        if (!name) return null;
+        this.addSymbol("type", name, ctx);
+        // `union S = A | B` → each member is a type edge from the union.
+        const members = ctx.unionMemberTypes?.();
+        if (members) {
+            for (const nt of findDescendants(members, "NamedTypeContext")) {
+                const tn = nameText((nt as { name?: () => unknown }).name?.());
+                if (tn) this.addRef("type", tn, nt as never, { container: name });
+            }
+        }
         return null;
     };
 
@@ -90,7 +103,8 @@ class TextGraphqlVisitor extends withExtractor(GraphQLVisitor) {
         const ivs = findDescendants(ctx, "InputValueDefinitionContext");
         for (const iv of ivs) {
             const nm = nameText((iv as { name?: () => unknown }).name?.());
-            if (nm) this.addSymbol("field", nm, ctx);
+            if (nm) this.addSymbol("field", nm, ctx, undefined, { container: name });
+            this.emitTypeRef((iv as { type_?: () => unknown }).type_?.(), name);
         }
         return null;
     };
@@ -108,6 +122,10 @@ class TextGraphqlVisitor extends withExtractor(GraphQLVisitor) {
         } else {
             this.addSymbol("field", name, ctx);
         }
+        // The field's (return) type — a type edge through any [list]/non-null!
+        // wrappers to the underlying named type. container = enclosing type
+        // (the active gateContainer scope).
+        this.emitTypeRef(ctx.type_?.());
         return null;
     };
 
@@ -143,6 +161,42 @@ class TextGraphqlVisitor extends withExtractor(GraphQLVisitor) {
         if (name) this.addSymbol("method", `fragment ${name}`, ctx);
         return null;
     };
+
+    // A field/input/argument type — recurse through `[list]` and `!` non-null
+    // wrappers to the underlying named type. Built-in scalars
+    // (String/Int/Float/Boolean/ID) are not refs. `container` overrides the
+    // active gateContainer scope (used by the manual input-field loop).
+    emitTypeRef(type_: unknown, container?: string): void {
+        const nt = namedTypeOf(type_);
+        if (!nt) return;
+        const name = nameText((nt as { name?: () => unknown }).name?.());
+        if (!name || BUILTIN_SCALARS.has(name)) return;
+        this.addRef("type", name, nt as never, container !== undefined ? { container } : undefined);
+    }
+
+    // `implements A & B` → an inherit edge per interface, sourced at `container`.
+    emitImplements(impl: unknown, container: string): void {
+        if (!impl) return;
+        for (const nt of findDescendants(impl, "NamedTypeContext")) {
+            const tn = nameText((nt as { name?: () => unknown }).name?.());
+            if (tn) this.addRef("inherit", tn, nt as never, { container });
+        }
+    }
+}
+
+const BUILTIN_SCALARS: ReadonlySet<string> = new Set(["String", "Int", "Float", "Boolean", "ID"]);
+
+// Recurse through listType (`[T]`) wrappers to the underlying namedType
+// context. The grammar attaches non-null `!` as an optional token on type_, so
+// it doesn't change the recursion.
+function namedTypeOf(type_: unknown): unknown | null {
+    if (!type_) return null;
+    const t = type_ as { namedType?: () => unknown; listType?: () => { type_?: () => unknown } | null };
+    const nt = t.namedType?.();
+    if (nt) return nt;
+    const lt = t.listType?.();
+    if (lt) return namedTypeOf(lt.type_?.());
+    return null;
 }
 
 function nameText(ctx: unknown): string | null {
